@@ -1,6 +1,6 @@
 # PFMS Pro
 
-PFMS Pro is a professional personal finance management system built with Flask and **database-free local file storage**. Instead of requiring MySQL, PostgreSQL, or SQLite services, the app stores its data in a JSON file so it is easier to deploy on small hosting environments, demos, and personal servers.
+PFMS Pro is a professional personal finance management system built with Flask and SQLAlchemy, designed to work with a **free hosted PostgreSQL database service** such as Supabase or Neon.
 
 ## Features
 
@@ -9,45 +9,53 @@ PFMS Pro is a professional personal finance management system built with Flask a
 - Expense analysis by category
 - Bill scheduling and due-date monitoring
 - Savings goal tracking
-- File-based storage with no SQL database setup
+- Hosted database support for deployment
 
 ## Technology
 
 - Flask
 - Flask-Login
-- Werkzeug password hashing
+- Flask-SQLAlchemy
+- PostgreSQL-compatible `DATABASE_URL`
 - Bootstrap 5 UI
-- JSON file persistence
+
+## Recommended free database services
+
+This app is now designed for a hosted PostgreSQL connection string.
+
+Examples:
+
+- Supabase free Postgres project
+- Neon free Postgres project
+
+Set the provider name in your environment for UI labeling:
+
+```bash
+export DB_PROVIDER="Supabase"
+```
 
 ## Getting started
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install flask flask-login
+pip install flask flask-login flask-sqlalchemy psycopg[binary]
+export DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/postgres"
+export DB_PROVIDER="Supabase"
 python app.py
 ```
-
-## Storage model
-
-The application stores all user and finance data in a JSON file.
-
-- Default path: `data/store.json`
-- Override path with: `PFMS_DATA_FILE=/path/to/store.json`
-
-This means deployment does **not** require:
-
-- MySQL
-- PostgreSQL
-- SQLite
-- Any external database service
 
 ## Configuration
 
 Optional environment variables:
 
 - `SECRET_KEY`: Flask session secret
-- `PFMS_DATA_FILE`: Path to the JSON data file
+- `DATABASE_URL`: Hosted PostgreSQL connection string
+- `DB_PROVIDER`: Friendly database provider label shown in the UI
+
+## Local development fallback
+
+If `DATABASE_URL` is not provided, the app falls back to a local SQLite file for development only. For deployment, use a hosted free database service.
 
 ## Core workflows
 
