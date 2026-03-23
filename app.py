@@ -1,648 +1,459 @@
-import smtplib
-import re
-from flask import Flask, render_template, redirect, url_for, flash, request, session
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from MySQLdb.cursors import DictCursor
-from flask_wtf import FlaskForm
-from wtforms import StringField, PasswordField, SubmitField
-from wtforms.validators import DataRequired, Email, Length, EqualTo, email, Regexp
-from twilio.rest import Client
-from flask import Flask, render_template, redirect, url_for, flash, request
-from flask_sqlalchemy import SQLAlchemy
-from flask_bcrypt import Bcrypt
-from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user, login_required
-from flask_mysqldb import MySQL
-from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, date
-from flask_mail import Mail, Message
-from datetime import datetime, timedelta
-import MySQLdb
+"""Main application entry point for PFMS Pro.
+
+This version uses SQLite with Flask-SQLAlchemy and Flask-Login.
+The UI templates remain largely unchanged, while backend storage now
+uses a proper relational database instead of JSON files.
+"""
+
+from __future__ import annotations
+
 import os
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
-# Flask app setup
+from flask import Flask, flash, redirect, render_template, request, url_for
+from flask_login import LoginManager, current_user, login_required, login_user, logout_user
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from models import Account, Bill, Category, SavingsGoal, Transaction, User, db
+
+
+SQLITE_DATABASE_URI = "sqlite:///pfms.db"
+
 app = Flask(__name__)
-app.secret_key = 'your_secret_key'
-app.config['MYSQL_HOST'] = 'localhost'
-app.config['MYSQL_USER'] = 'root'
-app.config['MYSQL_PASSWORD'] = 'Pass@1234'  # Replace with the correct password
-app.config['MYSQL_DB'] = 'finance_db'
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key")
+app.config["SQLALCHEMY_DATABASE_URI"] = SQLITE_DATABASE_URI
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
 
-
-mail = Mail(app)
-
-mysql = MySQL(app)
-bcrypt = Bcrypt(app)
+# Initialize extensions.
+db.init_app(app)
 login_manager = LoginManager(app)
-login_manager.login_view = 'login'
-
-# User model
-class User(UserMixin):
-    def __init__(self, id, username, email):
-        self.id = id
-        self.username = username
-        self.email = email
+login_manager.login_view = "login"
+login_manager.login_message_category = "warning"
 
 
 @login_manager.user_loader
-def load_user(id):
-    cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cursor.execute('SELECT * FROM users WHERE id = %s', (id,))
-    user = cursor.fetchone()
-    if user:
-        # Pass all required fields, including mobile_number
-        return User(user['id'], user['username'], user['email'])
-    return None
-
-# Forms
-class LoginForm(FlaskForm):
-    email = StringField('Email', validators=[DataRequired(), Email()])
-    password = PasswordField('Password', validators=[DataRequired()])
-    submit = SubmitField('Login')
+def load_user(user_id: str) -> User | None:
+    """Load the authenticated user for Flask-Login."""
+    return db.session.get(User, int(user_id))
 
 
-class RegisterForm(FlaskForm):
-    username = StringField('Username', validators=[DataRequired(), Length(min=4, max=20)])
-    email = StringField('Email', validators=[DataRequired(), Email()])
-    password = PasswordField('Password', validators=[
-        DataRequired(),
-        Length(min=8),
-        Regexp(r'(?=.*[A-Z])', message='Password must contain at least one uppercase letter'),
-        Regexp(r'(?=.*[a-z])', message='Password must contain at least one lowercase letter'),
-        Regexp(r'(?=.*\d)', message='Password must contain at least one digit'),
-        Regexp(r'(?=.*[@$!%*?&])', message='Password must contain at least one special character')
-    ])
-    confirm_password = PasswordField('Confirm Password', validators=[
-        DataRequired(),
-        EqualTo('password', message='Passwords must match')
-    ])
-class TransactionForm(FlaskForm):
-    date = StringField('Date', validators=[DataRequired()])
-    category = StringField('Category', validators=[DataRequired()])
-    amount = StringField('Amount', validators=[DataRequired()])
-    description = StringField('Description', validators=[DataRequired()])
-    type_of_transaction = StringField('Transaction Type (Income/Expense)', validators=[DataRequired()])
-    submit = SubmitField('Add Transaction')
-
-# Routes
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    form = LoginForm()
-    if form.validate_on_submit():
-        cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-        cursor.execute('SELECT * FROM users WHERE email = %s', (form.email.data,))
-        user = cursor.fetchone()
-        if user and bcrypt.check_password_hash(user['password_hash'], form.password.data):
-            login_user(User(user['id'], user['username'], user['email']))
-            return redirect(url_for('dashboard'))
-        flash('Login failed. Check your email and password.', 'danger')
-    return render_template('login.html', form=form)
+with app.app_context():
+    # Creates all tables on first run.
+    db.create_all()
 
 
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    form = RegisterForm()
-
-    if form.validate_on_submit():
-        cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-        # Check if the email already exists in the database
-        cursor.execute('SELECT * FROM users WHERE email = %s', (form.email.data,))
-        user = cursor.fetchone()
-
-        if user:
-            flash('Email already exists. Please use a different email.', 'danger')
-            return redirect(url_for('register'))
-
-        # Hash the password
-        hashed_password = bcrypt.generate_password_hash(form.password.data).decode('utf-8')
-
-        # Insert user data into the database (without mobile number)
-        cursor.execute('INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s)',
-                       (form.username.data, form.email.data, hashed_password))
-        mysql.connection.commit()
-
-        # Flash a success message
-        flash('Account created successfully! You can now log in.', 'success')
-        return redirect(url_for('login'))
-
-    return render_template('register.html', form=form)
-
-
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-    # If a balance is found, assign the amount, else set it to 0
-    cursor.execute('SELECT * FROM balance WHERE user_id = %s', (current_user.id,))
-    result = cursor.fetchone()
-    balance_amount = result['amount'] if result else 0
-
-
-    cursor.execute('SELECT * FROM bills WHERE user_id = %s', (current_user.id,))
-    bills = cursor.fetchall()
-
-    cursor.execute('SELECT * FROM transactions WHERE user_id = %s', (current_user.id,))
-    transactions = cursor.fetchall()
-
-    # Pass the data to the dashboard template
-    return render_template('dashboard.html', username=current_user.username,
-                           balance_amount=balance_amount, bills=bills, transactions=transactions)
-
-# Home route
-@app.route('/')
-def home():
-    return render_template('home.html')
-
-
-# --------------------------------------------------------------------------------------------------------------------------
-@app.route('/balance', methods=['GET', 'POST'])
-@login_required
-def balance():
-    total_balance = 0.0
-    accounts = []
-
-    if request.method == 'POST':
-        card_number = request.form.get('card_number')
-        cardholder_name = request.form.get('cardholder_name')
-        expiry_date = request.form.get('expiry_date')
-        cvv = request.form.get('cvv')
-        amount = request.form.get('amount')
-
-        # Server-side validations
-        errors = []
-        if not card_number or not re.match(r'^\d{12}$', card_number):
-            errors.append('Card number must be 12 digits.')
-        if not cardholder_name or len(cardholder_name.strip()) < 3:
-            errors.append('Cardholder name must be at least 3 characters long.')
-        if not expiry_date or not re.match(r'^\d{4}-\d{2}-\d{2}$', expiry_date):
-            errors.append('Expiry date must be in YYYY-MM-DD format.')
-        if not cvv or not re.match(r'^\d{3}$', cvv):
-            errors.append('CVV must be 3 digits.')
-        if not amount or not re.match(r'^\d+(\.\d{1,2})?$', amount) or float(amount) <= 0:
-            errors.append('Amount must be a positive number.')
-
-        if errors:
-            for error in errors:
-                flash(error, 'danger')
-            return redirect(url_for('balance'))
-
-        try:
-            # Insert account and update balance
-            cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-            # Insert into accounts table
-            insert_account_query = """
-                 INSERT INTO accounts (user_id, card_number, cardholder_name, expiry_date, cvv, amount)
-                 VALUES (%s, %s, %s, %s, %s, %s)
-             """
-            cursor.execute(insert_account_query,
-                           (current_user.id, card_number, cardholder_name, expiry_date, cvv, float(amount)))
-
-            # Update balance
-            cursor.execute("SELECT * FROM balance WHERE user_id = %s", (current_user.id,))
-            if cursor.fetchone() is None:
-                cursor.execute("INSERT INTO balance (user_id, amount) VALUES (%s, %s)",
-                               (current_user.id, float(amount)))
-            else:
-                cursor.execute('UPDATE balance SET amount = amount + %s WHERE user_id = %s',
-                               (float(amount), current_user.id))
-
-            # Commit changes
-            mysql.connection.commit()
-            flash('Account added successfully, and balance updated!', 'success')
-        except Exception as e:
-            mysql.connection.rollback()
-            print(f"Error during database operation: {e}")
-            flash(f'Error: {e}', 'danger')
-        finally:
-            cursor.close()
-
+def to_decimal(raw_value: str, field_name: str, *, allow_zero: bool = False) -> Decimal:
+    """Validate and normalize decimal input from forms."""
     try:
-        # Fetch current balance and account details
-        cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
+        value = Decimal(raw_value)
+    except (InvalidOperation, TypeError):
+        raise ValueError(f"{field_name} must be a valid number.")
 
-        # Fetch balance
-        cursor.execute("SELECT amount FROM balance WHERE user_id = %s", (current_user.id,))
-        result = cursor.fetchone()
-        total_balance = result['amount'] if result else 0.0
-
-        # Fetch accounts
-        cursor.execute("""
-             SELECT card_number, cardholder_name, expiry_date, cvv, amount
-             FROM accounts
-             WHERE user_id = %s
-         """, (current_user.id,))
-        accounts = cursor.fetchall()
-    except Exception as e:
-        print(f"Error fetching data: {e}")
-        flash(f'Error fetching data: {e}', 'danger')
-    finally:
-        cursor.close()
-
-    # Render template
-    return render_template('balance.html', accounts=accounts, balance_amount=total_balance,
-                           username=current_user.username)
+    minimum = Decimal("0.00") if allow_zero else Decimal("0.01")
+    if value < minimum or (not allow_zero and value == 0):
+        comparator = "zero or greater" if allow_zero else "greater than zero"
+        raise ValueError(f"{field_name} must be {comparator}.")
+    return value.quantize(Decimal("0.01"))
 
 
-# --------------------------------------------------------------------------------------------------------------------------
-
-@app.route('/transactions', methods=['GET', 'POST'])
-@login_required
-def transactions():
-    cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-    # Ensure the user has a balance initialized
-    cursor.execute('SELECT * FROM balance WHERE user_id = %s', (current_user.id,))
-    balance = cursor.fetchone()
-
-    if not balance:
-        cursor.execute('INSERT INTO balance (user_id, amount) VALUES (%s, %s)', (current_user.id, 0))
-        mysql.connection.commit()
-
-    if request.method == 'POST':
-        # Get the form data
-        date = request.form['date']
-        transaction_type = request.form['type']  # credit or debit
-        amount = request.form['amount']
-        category = request.form['category']
-        description = request.form['description']
-
-        # Validations
-        errors = []
-
-        # Date Validation (Ensure the date is in the correct format)
-        if not date or not re.match(r'\d{4}-\d{2}-\d{2}', date):  # Format YYYY-MM-DD
-            errors.append('Invalid date format. Please use YYYY-MM-DD.')
-
-        # Transaction Type Validation (Must be 'credit' or 'debit')
-        if transaction_type not in ['credit', 'debit']:
-            errors.append('Invalid transaction type. It must be either "credit" or "debit".')
-
-        # Amount Validation (Ensure it's a positive number)
-        try:
-            amount = float(amount)
-            if amount <= 0:
-                errors.append('Amount must be a positive number.')
-        except ValueError:
-            errors.append('Amount must be a valid number.')
-
-        # Category and Description Validation (Ensure they are not empty)
-        if not category or len(category.strip()) < 3:
-            errors.append('Category must be at least 3 characters long.')
-        if not description or len(description.strip()) < 3:
-            errors.append('Description must be at least 3 characters long.')
-
-        # If there are errors, flash them and redirect back to the transactions page
-        if errors:
-            for error in errors:
-                flash(error, 'danger')
-            return redirect(url_for('transactions'))
-
-        # Insert transaction into the database if no errors
-        try:
-            cursor.execute(''' 
-                INSERT INTO transactions (user_id, date, type, amount, category, description)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            ''', (current_user.id, date, transaction_type, amount, category, description))
-            mysql.connection.commit()
-
-            # Update the balance based on transaction type
-            if transaction_type == 'credit':
-                # Add the amount to the balance
-                cursor.execute('UPDATE balance SET amount = amount + %s WHERE user_id = %s', (amount, current_user.id))
-            elif transaction_type == 'debit':
-                # Deduct the amount from the balance
-                cursor.execute('UPDATE balance SET amount = amount - %s WHERE user_id = %s', (amount, current_user.id))
-
-            mysql.connection.commit()
-
-            # After transaction, check if any goal is met
-            check_goal_progress(current_user.id)
-
-            flash('Transaction added successfully!', 'success')
-        except Exception as e:
-            mysql.connection.rollback()
-            flash(f'Error: {e}', 'danger')
-
-        # Redirect back to the transactions page
-        return redirect(url_for('transactions'))
-
-    # Fetch the transactions for the user
-    cursor.execute('SELECT * FROM transactions WHERE user_id = %s', (current_user.id,))
-    transactions = cursor.fetchall()
-
-    return render_template('transactions.html', username=current_user.username, transactions=transactions)
+def parse_date(raw_value: str, field_name: str) -> date:
+    """Validate form date strings using the app's standard format."""
+    try:
+        return datetime.strptime(raw_value, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must use YYYY-MM-DD format.")
 
 
-@app.route('/delete_transaction/<int:transaction_id>', methods=['POST'])
-def delete_transaction(transaction_id):
-    cursor = mysql.connection.cursor()
-    cursor.execute("DELETE FROM transactions WHERE id = %s", (transaction_id,))
-    mysql.connection.commit()
-    cursor.close()
-    return redirect(url_for('transactions'))
+def currency(value: Decimal | float | int | str | None) -> str:
+    """Format currency values consistently in templates."""
+    numeric_value = Decimal(str(value or 0))
+    return f"₹{numeric_value:,.2f}"
 
 
-@app.route('/transaction_chart')
-def transaction_chart():
-    # Prepare data for pie chart
-    income = sum(t['amount'] for t in transactions if t['category'] == 'income')
-    expense = sum(t['amount'] for t in transactions if t['category'] == 'expense')
-    other = sum(t['amount'] for t in transactions if t['category'] == 'other')
+def get_or_create_category(user_id: int, name: str) -> Category:
+    """Return an existing category or create a new one for the user."""
+    normalized_name = name.strip().title()
+    category = Category.query.filter_by(user_id=user_id, name=normalized_name).first()
+    if category:
+        return category
 
-    chart_data = {
-        "labels": ['Income', 'Expense', 'Other'],
-        "datasets": [{
-            "data": [income, expense, other],
-            "backgroundColor": ['#36A2EB', '#FF5733', '#FFBF00'],
-            "hoverBackgroundColor": ['#2C3E50', '#C0392B', '#F39C12']
-        }]
+    category = Category(user_id=user_id, name=normalized_name)
+    db.session.add(category)
+    db.session.flush()
+    return category
+
+
+def update_account_balance(account: Account, transaction_type: str, amount: Decimal, *, reverse: bool = False) -> None:
+    """Update account balance when a transaction is added or removed."""
+    signed_amount = amount if transaction_type == "income" else -amount
+    if reverse:
+        signed_amount *= -1
+    account.balance = Decimal(str(account.balance)) + signed_amount
+
+
+@app.context_processor
+def inject_helpers() -> dict[str, object]:
+    """Helpers available to all Jinja templates."""
+    return {
+        "currency": currency,
+        "today": date.today().isoformat(),
+        "database_provider": "SQLite",
+        "database_target": SQLITE_DATABASE_URI,
     }
 
-    return render_template('expenses.html', chart_data=chart_data)
+
+@app.route("/")
+def home():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    return render_template("home.html")
 
 
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """Example route: create a new user account."""
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        errors: list[str] = []
+        if len(username) < 3:
+            errors.append("Username must be at least 3 characters long.")
+        if "@" not in email or "." not in email:
+            errors.append("Please enter a valid email address.")
+        if len(password) < 8:
+            errors.append("Password must be at least 8 characters long.")
+        if password != confirm_password:
+            errors.append("Passwords do not match.")
+        if User.query.filter_by(email=email).first():
+            errors.append("An account with that email already exists.")
+
+        if errors:
+            for error in errors:
+                flash(error, "danger")
+            return render_template("register.html")
+
+        user = User(username=username, email=email, password_hash=generate_password_hash(password))
+        db.session.add(user)
+        db.session.commit()
+        flash("Account created successfully. Please sign in.", "success")
+        return redirect(url_for("login"))
+
+    return render_template("register.html")
 
 
-# --------------------------------------------------------------------------------------------------------------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Example route: authenticate an existing user."""
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
 
-@app.route('/expenses', methods=['GET', 'POST'])
-def expenses():
-    cursor = mysql.connection.cursor()
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        user = User.query.filter_by(email=email).first()
 
-    # Fetching data for all types (expense, income, transfer) grouped by category for the current user
-    cursor.execute("""
-        SELECT category, SUM(amount) as total
-        FROM transactions
-        WHERE user_id = %s  -- Replace `user_id` with your column name for the user
-        GROUP BY category
-    """, (current_user.id,))  # Assuming you have `current_user.id` for the logged-in user
-    data = cursor.fetchall()
-    cursor.close()
+        if user and check_password_hash(user.password_hash, password):
+            login_user(user)
+            flash("Welcome back.", "success")
+            return redirect(url_for("dashboard"))
 
-    # Prepare data for the pie chart
-    labels = [row[0] for row in data]  # Extract categories
-    values = [row[1] for row in data]  # Extract total amounts
+        flash("Invalid email or password.", "danger")
 
-    # Fetching all transactions to display in the table (expenses only) for the current user
-    cursor = mysql.connection.cursor()
-    cursor.execute("""
-        SELECT category, amount, date
-        FROM transactions
-        WHERE user_id = %s
-    """, (current_user.id,))
-    transactions = cursor.fetchall()
-    cursor.close()
-
-    # Pass data to the template
-    return render_template(
-        'expenses.html',
-        username=current_user.username,
-        labels=labels,
-        values=values,
-        transactions=transactions
-    )
-
-# --------------------------------------------------------------------------------------------------------------------------
-
-@app.route('/goals', methods=['GET', 'POST'])
-@login_required
-def goals():
-    cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-    # Fetch goals for the current user
-    cursor.execute("SELECT * FROM goals WHERE user_id = %s", (current_user.id,))
-    goals = cursor.fetchall()
-
-    # Handle goal addition
-    if request.method == 'POST':
-        goal = request.form['goal']
-        target_amount = request.form.get('target_amount')
-        current_amount = request.form.get('current_amount')
-        due_date = request.form['due_date']
-
-        if not goal or not target_amount or not current_amount or not due_date:
-            flash('Please fill out all fields.', 'danger')
-            return redirect(url_for('goals'))
-
-        try:
-            cursor.execute(
-                "INSERT INTO goals (user_id, goal, target_amount, current_amount, due_date) VALUES (%s, %s, %s, %s, %s)",
-                (current_user.id, goal, float(target_amount), float(current_amount), due_date))
-            mysql.connection.commit()
-            flash('Goal added successfully!', 'success')
-
-        except MySQLdb.Error as e:
-            flash(f"Error adding goal: {e}", 'danger')
-
-        # Skip goal progress check after adding a new goal
-        session['skip_goal_check'] = True
-        return redirect(url_for('goals'))
-
-    # Check goal progress
-    if not session.get('skip_goal_check', False):
-        achievement_messages = check_goal_progress(current_user.id)
-        for message in achievement_messages:
-            flash(message, 'success')
-
-    # Reset session flag
-    session.pop('skip_goal_check', None)
-
-    return render_template('goals.html', username=current_user.username, goals=goals)
+    return render_template("login.html")
 
 
-def check_goal_progress(user_id):
-    cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-    # Fetch the user's goals
-    cursor.execute("SELECT * FROM goals WHERE user_id = %s", (user_id,))
-    goals = cursor.fetchall()
-
-    # Fetch the current balance for the user
-    cursor.execute("SELECT amount FROM balance WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-    current_balance = result['amount'] if result else 0
-
-    achievement_messages = []
-
-    # Check if any goal has been reached
-    for goal in goals:
-        target_amount = goal['target_amount']
-        if current_balance >= target_amount:
-            # Goal reached or exceeded
-            achievement_messages.append(f"Congratulations! You've reached your goal: {goal['goal']}!")
-            cursor.execute('UPDATE goals SET status = "Completed" WHERE id = %s AND user_id = %s',
-                           (goal['id'], user_id))
-            mysql.connection.commit()
-
-    cursor.close()
-    return achievement_messages
-
-
-@app.route('/delete_goal/<int:goal_id>', methods=['POST'])
-@login_required
-def delete_goal(goal_id):
-    cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-    try:
-        # Delete the goal from the database
-        cursor.execute('DELETE FROM goals WHERE id = %s AND user_id = %s', (goal_id, current_user.id))
-        mysql.connection.commit()
-
-        # Flash a success message
-        flash('Goal deleted successfully!', 'success')
-    except MySQLdb.Error as e:
-        flash(f"Error deleting goal: {e}", 'danger')
-
-    # Redirect back to the goals page
-    return redirect(url_for('goals'))
-# --------------------------------------------------------------------------------------------------------------------------
-
-
-def send_email_alert(user_email, category, amount, due_date):
-    sender_email = 'shrutisalve.exe@gmail.com'  # Replace with your Gmail account
-    sender_password = 'ifqr vlyn odsn hinu'     # Replace with your app password for Gmail
-    smtp_server = 'smtp.gmail.com'
-    smtp_port = 587
-
-    receiver_email = user_email
-
-    # Email content
-    subject = f"Reminder: Upcoming {category} Bill Payment Due Tomorrow"
-    body = f"""
-Dear {receiver_email.split('@')[0]},
-
-We hope this message finds you well! This is a kind reminder that your {category} bill is due tomorrow. Below are the details of your upcoming payment:
-
------------------------------------------------------------
-Bill Details
------------------------------------------------------------
-Category   : {category}
-Amount Due : Rs. {amount:.2f}
-Due Date   : {due_date}
------------------------------------------------------------
-
-What You Need to Do:
-Please ensure that the payment is completed before the due date to avoid late fees or service interruptions. Timely payments also help in maintaining a good credit history.
-
-How to Pay:
-- Online Banking / UPI: Use your preferred bank's net banking or apps like Google Pay or PhonePe.
-- Credit / Debit Card Payments: Accessible via our online portal or mobile app.
-- Authorized Collection Centers: Visit your nearest bill payment center.
-
-Need Assistance?
-If you have any questions or require further assistance, feel free to reach out to our customer service team. We're here to help!
-
-Why It's Important:
-Staying current with your payments avoids penalties, keeps your account in good standing, and ensures uninterrupted services.
-
-Thank you for being a valued part of our community. We truly appreciate your cooperation.
-
-Warm Regards,  
-[PFMS-Personal Finanace Manager System]  
-[Contact Information | 9308021312 | shrutisalve.exe@gmail.com]  
-
-P.S. Paying your bill early or on time ensures a hassle-free experience!
-    """
-
-    try:
-        # Create email message
-        msg = MIMEMultipart()
-        msg['From'] = sender_email
-        msg['To'] = receiver_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-
-        # Send email via SMTP
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()  # Secure the connection
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, receiver_email, msg.as_string())
-            print(f"Email sent to {user_email} successfully!")
-            return True
-    except smtplib.SMTPAuthenticationError as e:
-        print(f"SMTP Authentication error: {e}")
-        flash("Authentication failed. Please check your email credentials.", "danger")
-    except smtplib.SMTPException as e:
-        print(f"SMTP error: {e}")
-        flash(f"Failed to send email: {e}", "danger")
-    except Exception as e:
-        print(f"Error sending email: {e}")
-        flash(f"Failed to send email: {e}", "danger")
-    return False
-
-
-@app.route('/bills', methods=['GET', 'POST'])
-@login_required
-def bills():
-    cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-    # Fetch bills for the current user
-    cursor.execute("SELECT * FROM bills WHERE user_id = %s", (current_user.id,))
-    bills = cursor.fetchall()
-
-    if request.method == 'POST':
-        # Get form data
-        date = request.form['date']
-        category = request.form['category']
-        amount = float(request.form['amount'])
-        due_date = request.form['due_date']
-        description = request.form['description']
-
-        try:
-            # Insert the bill into the database
-            cursor.execute('''
-                INSERT INTO bills (user_id, date, category, amount, due_date, description) 
-                VALUES (%s, %s, %s, %s, %s, %s)
-            ''', (current_user.id, date, category, amount, due_date, description))
-            mysql.connection.commit()
-
-            # Fetch the user's email
-            cursor.execute('SELECT email FROM users WHERE id = %s', (current_user.id,))
-            user = cursor.fetchone()
-            user_email = user['email']
-
-            if user_email:
-                due_date_obj = datetime.strptime(due_date, '%Y-%m-%d')
-                current_date = datetime.now()
-
-                # Check if the due date is tomorrow
-                if (due_date_obj - current_date).days == 1:
-                    send_email_alert(user_email, category, amount, due_date)
-
-            flash('Bill added successfully and reminder sent!', 'success')
-        except MySQLdb.Error as e:
-            flash(f"Error adding bill: {e}", 'danger')
-            return redirect(url_for('bills'))
-
-    return render_template('bills.html', username=current_user.username, bills=bills)
-
-
-# Delete Bill Route
-@app.route('/delete_bill/<int:bill_id>', methods=['POST'])
-@login_required
-def delete_bill(bill_id):
-    cursor = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-
-    try:
-        # Delete the bill from the database
-        cursor.execute('DELETE FROM bills WHERE id = %s AND user_id = %s', (bill_id, current_user.id))
-        mysql.connection.commit()
-        flash('Bill deleted successfully!', 'success')
-    except MySQLdb.Error as e:
-        flash(f"Error deleting bill: {e}", 'danger')
-
-    return redirect(url_for('bills'))
-
-
-@app.route('/logout')
+@app.route("/logout")
 @login_required
 def logout():
     logout_user()
-    flash('You have been logged out.', 'info')
-    return redirect(url_for('login'))
+    flash("You have been logged out.", "info")
+    return redirect(url_for("login"))
+
+
+def build_dashboard_context() -> dict[str, object]:
+    """Collect all data needed by the dashboard route."""
+    accounts = Account.query.filter_by(user_id=current_user.id).order_by(Account.created_at.desc()).all()
+    transactions = (
+        Transaction.query.filter_by(user_id=current_user.id)
+        .order_by(Transaction.entry_date.desc(), Transaction.created_at.desc())
+        .all()
+    )
+    bills = Bill.query.filter_by(user_id=current_user.id).order_by(Bill.due_date.asc()).all()
+    goals = SavingsGoal.query.filter_by(user_id=current_user.id).order_by(SavingsGoal.due_date.asc()).all()
+
+    total_balance = sum((Decimal(str(item.balance)) for item in accounts), Decimal("0"))
+    total_income = sum(
+        (Decimal(str(item.amount)) for item in transactions if item.transaction_type == "income"),
+        Decimal("0"),
+    )
+    total_expenses = sum(
+        (Decimal(str(item.amount)) for item in transactions if item.transaction_type == "expense"),
+        Decimal("0"),
+    )
+    upcoming_bills = [bill for bill in bills if bill.due_date >= date.today()][:5]
+
+    expense_totals: dict[str, Decimal] = {}
+    for item in transactions:
+        if item.transaction_type != "expense":
+            continue
+        category_name = item.category.name if item.category else "Uncategorized"
+        expense_totals[category_name] = expense_totals.get(category_name, Decimal("0")) + Decimal(str(item.amount))
+
+    spending_by_category = sorted(expense_totals.items(), key=lambda entry: entry[1], reverse=True)
+
+    return {
+        "accounts": accounts,
+        "transactions": transactions,
+        "bills": bills,
+        "goals": goals,
+        "total_balance": total_balance,
+        "monthly_income": total_income,
+        "monthly_expenses": total_expenses,
+        "net_cash_flow": total_income - total_expenses,
+        "upcoming_bills": upcoming_bills,
+        "spending_by_category": spending_by_category,
+    }
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    """Example route: main dashboard overview."""
+    return render_template("dashboard.html", **build_dashboard_context())
+
+
+@app.route("/balance", methods=["GET", "POST"])
+@login_required
+def balance():
+    if request.method == "POST":
+        institution = request.form.get("institution", "").strip()
+        account_name = request.form.get("account_name", "").strip()
+        account_type = request.form.get("account_type", "").strip() or "Checking"
+        last_four = request.form.get("last_four", "").strip()
+
+        try:
+            starting_balance = to_decimal(request.form.get("balance", ""), "Balance")
+            if len(institution) < 2 or len(account_name) < 2:
+                raise ValueError("Institution and account name must be at least 2 characters long.")
+            if len(last_four) != 4 or not last_four.isdigit():
+                raise ValueError("Last four digits must contain exactly 4 numbers.")
+
+            db.session.add(
+                Account(
+                    user_id=current_user.id,
+                    institution=institution,
+                    account_name=account_name,
+                    account_type=account_type,
+                    last_four=last_four,
+                    balance=starting_balance,
+                )
+            )
+            db.session.commit()
+            flash("Account added successfully.", "success")
+            return redirect(url_for("balance"))
+        except ValueError as exc:
+            flash(str(exc), "danger")
+
+    accounts = Account.query.filter_by(user_id=current_user.id).order_by(Account.created_at.desc()).all()
+    total_balance = sum((Decimal(str(account.balance)) for account in accounts), Decimal("0"))
+    return render_template("balance.html", accounts=accounts, total_balance=total_balance)
+
+
+@app.route("/transactions", methods=["GET", "POST"])
+@login_required
+def transactions():
+    """Example route: add and list transactions using the database."""
+    accounts = Account.query.filter_by(user_id=current_user.id).order_by(Account.account_name.asc()).all()
+    categories = Category.query.filter_by(user_id=current_user.id).order_by(Category.name.asc()).all()
+
+    if request.method == "POST":
+        transaction_type = request.form.get("transaction_type", "").strip().lower()
+        category_name = request.form.get("category", "").strip()
+        description = request.form.get("description", "").strip()
+        account_id = request.form.get("account_id", "").strip()
+
+        try:
+            if not accounts:
+                raise ValueError("Please add an account before recording transactions.")
+
+            entry_date = parse_date(request.form.get("entry_date", ""), "Transaction date")
+            amount = to_decimal(request.form.get("amount", ""), "Amount")
+            if transaction_type not in {"income", "expense"}:
+                raise ValueError("Transaction type must be income or expense.")
+            if len(category_name) < 2:
+                raise ValueError("Category must be at least 2 characters long.")
+            if len(description) < 3:
+                raise ValueError("Description must be at least 3 characters long.")
+
+            account = Account.query.filter_by(id=int(account_id), user_id=current_user.id).first()
+            if not account:
+                raise ValueError("Please choose a valid account.")
+
+            category = get_or_create_category(current_user.id, category_name)
+            transaction = Transaction(
+                user_id=current_user.id,
+                account_id=account.id,
+                category_id=category.id,
+                entry_date=entry_date,
+                transaction_type=transaction_type,
+                amount=amount,
+                description=description,
+            )
+            update_account_balance(account, transaction_type, amount)
+            db.session.add(transaction)
+            db.session.commit()
+            flash("Transaction recorded successfully.", "success")
+            return redirect(url_for("transactions"))
+        except ValueError as exc:
+            db.session.rollback()
+            flash(str(exc), "danger")
+
+    transactions_list = (
+        Transaction.query.filter_by(user_id=current_user.id)
+        .order_by(Transaction.entry_date.desc(), Transaction.created_at.desc())
+        .all()
+    )
+    return render_template(
+        "transactions.html",
+        transactions=transactions_list,
+        accounts=accounts,
+        categories=categories,
+    )
+
+
+@app.route("/delete_transaction/<int:transaction_id>", methods=["POST"])
+@login_required
+def delete_transaction(transaction_id: int):
+    transaction = Transaction.query.filter_by(id=transaction_id, user_id=current_user.id).first_or_404()
+    update_account_balance(transaction.account, transaction.transaction_type, Decimal(str(transaction.amount)), reverse=True)
+    db.session.delete(transaction)
+    db.session.commit()
+    flash("Transaction deleted.", "info")
+    return redirect(url_for("transactions"))
+
+
+@app.route("/expenses")
+@login_required
+def expenses():
+    transaction_rows = (
+        Transaction.query.filter_by(user_id=current_user.id, transaction_type="expense")
+        .order_by(Transaction.entry_date.desc(), Transaction.created_at.desc())
+        .all()
+    )
+
+    expense_totals: dict[str, Decimal] = {}
+    for row in transaction_rows:
+        category_name = row.category.name if row.category else "Uncategorized"
+        expense_totals[category_name] = expense_totals.get(category_name, Decimal("0")) + Decimal(str(row.amount))
+
+    spending_by_category = sorted(expense_totals.items(), key=lambda entry: entry[1], reverse=True)
+    total_expenses = sum((Decimal(str(item.amount)) for item in transaction_rows), Decimal("0"))
+    return render_template(
+        "expenses.html",
+        spending_by_category=spending_by_category,
+        transactions=transaction_rows,
+        total_expenses=total_expenses,
+    )
+
+
+@app.route("/bills", methods=["GET", "POST"])
+@login_required
+def bills():
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        category = request.form.get("category", "").strip()
+        status = request.form.get("status", "Upcoming").strip()
+        notes = request.form.get("notes", "").strip()
+
+        try:
+            amount = to_decimal(request.form.get("amount", ""), "Amount")
+            due_date = parse_date(request.form.get("due_date", ""), "Due date")
+            if len(title) < 2 or len(category) < 2:
+                raise ValueError("Title and category must be at least 2 characters long.")
+            if status not in {"Upcoming", "Paid", "Overdue"}:
+                raise ValueError("Status must be Upcoming, Paid, or Overdue.")
+
+            db.session.add(
+                Bill(
+                    user_id=current_user.id,
+                    title=title,
+                    category=category,
+                    amount=amount,
+                    due_date=due_date,
+                    status=status,
+                    notes=notes,
+                )
+            )
+            db.session.commit()
+            flash("Bill scheduled successfully.", "success")
+            return redirect(url_for("bills"))
+        except ValueError as exc:
+            flash(str(exc), "danger")
+
+    bills_list = Bill.query.filter_by(user_id=current_user.id).order_by(Bill.due_date.asc()).all()
+    return render_template("bills.html", bills=bills_list)
+
+
+@app.route("/delete_bill/<int:bill_id>", methods=["POST"])
+@login_required
+def delete_bill(bill_id: int):
+    bill = Bill.query.filter_by(id=bill_id, user_id=current_user.id).first_or_404()
+    db.session.delete(bill)
+    db.session.commit()
+    flash("Bill deleted.", "info")
+    return redirect(url_for("bills"))
+
+
+@app.route("/goals", methods=["GET", "POST"])
+@login_required
+def goals():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+
+        try:
+            target_amount = to_decimal(request.form.get("target_amount", ""), "Target amount")
+            current_amount = to_decimal(request.form.get("current_amount", ""), "Current amount", allow_zero=True)
+            due_date = parse_date(request.form.get("due_date", ""), "Target date")
+            if len(name) < 2:
+                raise ValueError("Goal name must be at least 2 characters long.")
+            if current_amount > target_amount:
+                raise ValueError("Current amount cannot exceed the target amount.")
+
+            db.session.add(
+                SavingsGoal(
+                    user_id=current_user.id,
+                    name=name,
+                    target_amount=target_amount,
+                    current_amount=current_amount,
+                    due_date=due_date,
+                )
+            )
+            db.session.commit()
+            flash("Financial goal added successfully.", "success")
+            return redirect(url_for("goals"))
+        except ValueError as exc:
+            flash(str(exc), "danger")
+
+    goals_list = SavingsGoal.query.filter_by(user_id=current_user.id).order_by(SavingsGoal.due_date.asc()).all()
+    return render_template("goals.html", goals=goals_list)
+
+
+@app.route("/delete_goal/<int:goal_id>", methods=["POST"])
+@login_required
+def delete_goal(goal_id: int):
+    goal = SavingsGoal.query.filter_by(id=goal_id, user_id=current_user.id).first_or_404()
+    db.session.delete(goal)
+    db.session.commit()
+    flash("Goal deleted.", "info")
+    return redirect(url_for("goals"))
 
 
 if __name__ == "__main__":
