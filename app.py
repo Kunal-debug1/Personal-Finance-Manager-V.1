@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
 
 from flask import Flask, flash, redirect, render_template, request, url_for
 from flask_login import (
@@ -13,82 +17,98 @@ from flask_login import (
     login_user,
     logout_user,
 )
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DATABASE_PATH = os.path.join(BASE_DIR, "finance_manager.db")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_FILE = Path(os.environ.get("PFMS_DATA_FILE", DATA_DIR / "store.json"))
+COLLECTIONS = ("users", "accounts", "transactions", "bills", "goals")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key")
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
-    "DATABASE_URL", f"sqlite:///{DATABASE_PATH}"
-)
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 login_manager.login_message_category = "warning"
 
 
-class User(db.Model, UserMixin):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+@dataclass
+class User(UserMixin):
+    id: str
+    username: str
+    email: str
+    password_hash: str
+    created_at: str
 
 
-class Account(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    institution = db.Column(db.String(120), nullable=False)
-    account_name = db.Column(db.String(120), nullable=False)
-    account_type = db.Column(db.String(40), nullable=False)
-    balance = db.Column(db.Numeric(12, 2), nullable=False, default=0)
-    last_four = db.Column(db.String(4), nullable=False, default="0000")
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+class JsonStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self._write(self._empty_state())
+
+    @staticmethod
+    def _empty_state() -> dict[str, list[dict[str, Any]]]:
+        return {name: [] for name in COLLECTIONS}
+
+    def _read(self) -> dict[str, list[dict[str, Any]]]:
+        if not self.path.exists():
+            return self._empty_state()
+        with self.path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def _write(self, payload: dict[str, list[dict[str, Any]]]) -> None:
+        with self.path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    def all(self, collection: str) -> list[dict[str, Any]]:
+        return self._read().get(collection, [])
+
+    def next_id(self, collection: str) -> str:
+        rows = self.all(collection)
+        if not rows:
+            return "1"
+        return str(max(int(row["id"]) for row in rows) + 1)
+
+    def insert(self, collection: str, record: dict[str, Any]) -> dict[str, Any]:
+        payload = self._read()
+        payload.setdefault(collection, []).append(record)
+        self._write(payload)
+        return record
+
+    def replace(self, collection: str, records: list[dict[str, Any]]) -> None:
+        payload = self._read()
+        payload[collection] = records
+        self._write(payload)
+
+    def delete(self, collection: str, record_id: str, *, user_id: str | None = None) -> bool:
+        payload = self._read()
+        original = payload.get(collection, [])
+        filtered = [
+            row
+            for row in original
+            if not (row.get("id") == record_id and (user_id is None or row.get("user_id") == user_id))
+        ]
+        removed = len(filtered) != len(original)
+        if removed:
+            payload[collection] = filtered
+            self._write(payload)
+        return removed
 
 
-class Transaction(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    entry_date = db.Column(db.Date, nullable=False)
-    transaction_type = db.Column(db.String(10), nullable=False)
-    category = db.Column(db.String(60), nullable=False)
-    amount = db.Column(db.Numeric(12, 2), nullable=False)
-    description = db.Column(db.String(255), nullable=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-
-class Bill(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    title = db.Column(db.String(120), nullable=False)
-    category = db.Column(db.String(60), nullable=False)
-    amount = db.Column(db.Numeric(12, 2), nullable=False)
-    due_date = db.Column(db.Date, nullable=False)
-    status = db.Column(db.String(20), nullable=False, default="Upcoming")
-    notes = db.Column(db.String(255), nullable=False, default="")
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-
-class Goal(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    name = db.Column(db.String(120), nullable=False)
-    target_amount = db.Column(db.Numeric(12, 2), nullable=False)
-    current_amount = db.Column(db.Numeric(12, 2), nullable=False, default=0)
-    due_date = db.Column(db.Date, nullable=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+store = JsonStore(DATA_FILE)
 
 
 @login_manager.user_loader
 def load_user(user_id: str) -> User | None:
-    return db.session.get(User, int(user_id))
+    user_record = find_user_by_id(user_id)
+    return user_from_record(user_record) if user_record else None
+
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
 
 
 def to_decimal(raw_value: str, field_name: str, *, allow_zero: bool = False) -> Decimal:
@@ -111,18 +131,44 @@ def parse_date(raw_value: str, field_name: str) -> date:
         raise ValueError(f"{field_name} must use YYYY-MM-DD format.")
 
 
-def currency(value: Decimal | float | int | None) -> str:
-    numeric_value = Decimal(value or 0)
+def currency(value: Decimal | float | int | str | None) -> str:
+    numeric_value = Decimal(str(value or 0))
     return f"₹{numeric_value:,.2f}"
+
+
+def decimal_string(value: Decimal) -> str:
+    return format(value.quantize(Decimal("0.01")), "f")
+
+
+def user_from_record(record: dict[str, Any]) -> User:
+    return User(
+        id=record["id"],
+        username=record["username"],
+        email=record["email"],
+        password_hash=record["password_hash"],
+        created_at=record["created_at"],
+    )
+
+
+def find_user_by_email(email: str) -> dict[str, Any] | None:
+    return next((user for user in store.all("users") if user["email"] == email), None)
+
+
+def find_user_by_id(user_id: str) -> dict[str, Any] | None:
+    return next((user for user in store.all("users") if user["id"] == str(user_id)), None)
+
+
+def records_for_user(collection: str, user_id: str) -> list[dict[str, Any]]:
+    return [row for row in store.all(collection) if row.get("user_id") == str(user_id)]
+
+
+def sort_by_date(records: list[dict[str, Any]], field_name: str, reverse: bool = False) -> list[dict[str, Any]]:
+    return sorted(records, key=lambda row: (row.get(field_name, ""), row.get("created_at", "")), reverse=reverse)
 
 
 @app.context_processor
 def inject_helpers() -> dict[str, object]:
-    return {"currency": currency, "today": date.today()}
-
-
-with app.app_context():
-    db.create_all()
+    return {"currency": currency, "today": date.today().isoformat()}
 
 
 @app.route("/")
@@ -152,7 +198,7 @@ def register():
             errors.append("Password must be at least 8 characters long.")
         if password != confirm_password:
             errors.append("Passwords do not match.")
-        if User.query.filter_by(email=email).first():
+        if find_user_by_email(email):
             errors.append("An account with that email already exists.")
 
         if errors:
@@ -160,13 +206,16 @@ def register():
                 flash(error, "danger")
             return render_template("register.html")
 
-        user = User(
-            username=username,
-            email=email,
-            password_hash=generate_password_hash(password),
+        store.insert(
+            "users",
+            {
+                "id": store.next_id("users"),
+                "username": username,
+                "email": email,
+                "password_hash": generate_password_hash(password),
+                "created_at": now_iso(),
+            },
         )
-        db.session.add(user)
-        db.session.commit()
         flash("Account created successfully. Please sign in.", "success")
         return redirect(url_for("login"))
 
@@ -181,10 +230,10 @@ def login():
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
-        user = User.query.filter_by(email=email).first()
+        user_record = find_user_by_email(email)
 
-        if user and check_password_hash(user.password_hash, password):
-            login_user(user)
+        if user_record and check_password_hash(user_record["password_hash"], password):
+            login_user(user_from_record(user_record))
             flash("Welcome back.", "success")
             return redirect(url_for("dashboard"))
 
@@ -202,40 +251,33 @@ def logout():
 
 
 def build_dashboard_context() -> dict[str, object]:
-    accounts = (
-        Account.query.filter_by(user_id=current_user.id)
-        .order_by(Account.created_at.desc())
-        .all()
-    )
-    transactions = (
-        Transaction.query.filter_by(user_id=current_user.id)
-        .order_by(Transaction.entry_date.desc(), Transaction.created_at.desc())
-        .all()
-    )
-    bills = (
-        Bill.query.filter_by(user_id=current_user.id)
-        .order_by(Bill.due_date.asc())
-        .all()
-    )
-    goals = Goal.query.filter_by(user_id=current_user.id).order_by(Goal.due_date.asc()).all()
+    user_id = str(current_user.id)
+    accounts = sort_by_date(records_for_user("accounts", user_id), "created_at", reverse=True)
+    transactions = sort_by_date(records_for_user("transactions", user_id), "entry_date", reverse=True)
+    bills = sort_by_date(records_for_user("bills", user_id), "due_date")
+    goals = sort_by_date(records_for_user("goals", user_id), "due_date")
 
-    total_balance = sum((Decimal(account.balance) for account in accounts), Decimal("0"))
-    monthly_income = sum(
-        (Decimal(item.amount) for item in transactions if item.transaction_type == "income"),
+    total_balance = sum((Decimal(item["balance"]) for item in accounts), Decimal("0"))
+    total_income = sum(
+        (Decimal(item["amount"]) for item in transactions if item["transaction_type"] == "income"),
         Decimal("0"),
     )
-    monthly_expenses = sum(
-        (Decimal(item.amount) for item in transactions if item.transaction_type == "expense"),
+    total_expenses = sum(
+        (Decimal(item["amount"]) for item in transactions if item["transaction_type"] == "expense"),
         Decimal("0"),
     )
-    upcoming_bills = [bill for bill in bills if bill.due_date >= date.today()][:5]
+    upcoming_bills = [bill for bill in bills if bill["due_date"] >= date.today().isoformat()][:5]
 
-    spending_by_category = (
-        db.session.query(Transaction.category, func.sum(Transaction.amount))
-        .filter_by(user_id=current_user.id, transaction_type="expense")
-        .group_by(Transaction.category)
-        .order_by(func.sum(Transaction.amount).desc())
-        .all()
+    expense_totals: dict[str, Decimal] = {}
+    for item in transactions:
+        if item["transaction_type"] != "expense":
+            continue
+        expense_totals[item["category"]] = expense_totals.get(item["category"], Decimal("0")) + Decimal(item["amount"])
+
+    spending_by_category = sorted(
+        ((category, decimal_string(amount)) for category, amount in expense_totals.items()),
+        key=lambda entry: Decimal(entry[1]),
+        reverse=True,
     )
 
     return {
@@ -243,12 +285,14 @@ def build_dashboard_context() -> dict[str, object]:
         "transactions": transactions,
         "bills": bills,
         "goals": goals,
-        "total_balance": total_balance,
-        "monthly_income": monthly_income,
-        "monthly_expenses": monthly_expenses,
-        "net_cash_flow": monthly_income - monthly_expenses,
+        "total_balance": decimal_string(total_balance),
+        "monthly_income": decimal_string(total_income),
+        "monthly_expenses": decimal_string(total_expenses),
+        "net_cash_flow": decimal_string(total_income - total_expenses),
         "upcoming_bills": upcoming_bills,
         "spending_by_category": spending_by_category,
+        "storage_mode": "Local JSON file storage",
+        "storage_path": str(DATA_FILE.relative_to(BASE_DIR)) if DATA_FILE.is_relative_to(BASE_DIR) else str(DATA_FILE),
     }
 
 
@@ -264,7 +308,7 @@ def balance():
     if request.method == "POST":
         institution = request.form.get("institution", "").strip()
         account_name = request.form.get("account_name", "").strip()
-        account_type = request.form.get("account_type", "").strip()
+        account_type = request.form.get("account_type", "").strip() or "Checking"
         last_four = request.form.get("last_four", "").strip()
 
         try:
@@ -274,29 +318,27 @@ def balance():
             if len(last_four) != 4 or not last_four.isdigit():
                 raise ValueError("Last four digits must contain exactly 4 numbers.")
 
-            db.session.add(
-                Account(
-                    user_id=current_user.id,
-                    institution=institution,
-                    account_name=account_name,
-                    account_type=account_type or "Checking",
-                    balance=starting_balance,
-                    last_four=last_four,
-                )
+            store.insert(
+                "accounts",
+                {
+                    "id": store.next_id("accounts"),
+                    "user_id": str(current_user.id),
+                    "institution": institution,
+                    "account_name": account_name,
+                    "account_type": account_type,
+                    "last_four": last_four,
+                    "balance": decimal_string(starting_balance),
+                    "created_at": now_iso(),
+                },
             )
-            db.session.commit()
             flash("Account added successfully.", "success")
             return redirect(url_for("balance"))
         except ValueError as exc:
             flash(str(exc), "danger")
 
-    accounts = (
-        Account.query.filter_by(user_id=current_user.id)
-        .order_by(Account.created_at.desc())
-        .all()
-    )
-    total_balance = sum((Decimal(account.balance) for account in accounts), Decimal("0"))
-    return render_template("balance.html", accounts=accounts, total_balance=total_balance)
+    accounts = sort_by_date(records_for_user("accounts", str(current_user.id)), "created_at", reverse=True)
+    total_balance = sum((Decimal(account["balance"]) for account in accounts), Decimal("0"))
+    return render_template("balance.html", accounts=accounts, total_balance=decimal_string(total_balance))
 
 
 @app.route("/transactions", methods=["GET", "POST"])
@@ -317,61 +359,59 @@ def transactions():
             if len(description) < 3:
                 raise ValueError("Description must be at least 3 characters long.")
 
-            db.session.add(
-                Transaction(
-                    user_id=current_user.id,
-                    entry_date=entry_date,
-                    transaction_type=transaction_type,
-                    category=category,
-                    amount=amount,
-                    description=description,
-                )
+            store.insert(
+                "transactions",
+                {
+                    "id": store.next_id("transactions"),
+                    "user_id": str(current_user.id),
+                    "entry_date": entry_date.isoformat(),
+                    "transaction_type": transaction_type,
+                    "category": category,
+                    "amount": decimal_string(amount),
+                    "description": description,
+                    "created_at": now_iso(),
+                },
             )
-            db.session.commit()
             flash("Transaction recorded successfully.", "success")
             return redirect(url_for("transactions"))
         except ValueError as exc:
             flash(str(exc), "danger")
 
-    transactions_list = (
-        Transaction.query.filter_by(user_id=current_user.id)
-        .order_by(Transaction.entry_date.desc(), Transaction.created_at.desc())
-        .all()
-    )
+    transactions_list = sort_by_date(records_for_user("transactions", str(current_user.id)), "entry_date", reverse=True)
     return render_template("transactions.html", transactions=transactions_list)
 
 
-@app.route("/delete_transaction/<int:transaction_id>", methods=["POST"])
+@app.route("/delete_transaction/<record_id>", methods=["POST"])
 @login_required
-def delete_transaction(transaction_id: int):
-    transaction = Transaction.query.filter_by(id=transaction_id, user_id=current_user.id).first_or_404()
-    db.session.delete(transaction)
-    db.session.commit()
-    flash("Transaction deleted.", "info")
+def delete_transaction(record_id: str):
+    removed = store.delete("transactions", record_id, user_id=str(current_user.id))
+    flash("Transaction deleted." if removed else "Transaction not found.", "info" if removed else "warning")
     return redirect(url_for("transactions"))
 
 
 @app.route("/expenses")
 @login_required
 def expenses():
-    spending_by_category = (
-        db.session.query(Transaction.category, func.sum(Transaction.amount))
-        .filter_by(user_id=current_user.id, transaction_type="expense")
-        .group_by(Transaction.category)
-        .order_by(func.sum(Transaction.amount).desc())
-        .all()
+    transaction_rows = [
+        row for row in records_for_user("transactions", str(current_user.id)) if row["transaction_type"] == "expense"
+    ]
+    transaction_rows = sort_by_date(transaction_rows, "entry_date", reverse=True)
+
+    expense_totals: dict[str, Decimal] = {}
+    for row in transaction_rows:
+        expense_totals[row["category"]] = expense_totals.get(row["category"], Decimal("0")) + Decimal(row["amount"])
+
+    spending_by_category = sorted(
+        ((category, decimal_string(amount)) for category, amount in expense_totals.items()),
+        key=lambda entry: Decimal(entry[1]),
+        reverse=True,
     )
-    transactions_list = (
-        Transaction.query.filter_by(user_id=current_user.id, transaction_type="expense")
-        .order_by(Transaction.entry_date.desc())
-        .all()
-    )
-    total_expenses = sum((Decimal(item.amount) for item in transactions_list), Decimal("0"))
+    total_expenses = sum((Decimal(item["amount"]) for item in transaction_rows), Decimal("0"))
     return render_template(
         "expenses.html",
         spending_by_category=spending_by_category,
-        transactions=transactions_list,
-        total_expenses=total_expenses,
+        transactions=transaction_rows,
+        total_expenses=decimal_string(total_expenses),
     )
 
 
@@ -392,34 +432,34 @@ def bills():
             if status not in {"Upcoming", "Paid", "Overdue"}:
                 raise ValueError("Status must be Upcoming, Paid, or Overdue.")
 
-            db.session.add(
-                Bill(
-                    user_id=current_user.id,
-                    title=title,
-                    category=category,
-                    amount=amount,
-                    due_date=due_date,
-                    status=status,
-                    notes=notes,
-                )
+            store.insert(
+                "bills",
+                {
+                    "id": store.next_id("bills"),
+                    "user_id": str(current_user.id),
+                    "title": title,
+                    "category": category,
+                    "amount": decimal_string(amount),
+                    "due_date": due_date.isoformat(),
+                    "status": status,
+                    "notes": notes,
+                    "created_at": now_iso(),
+                },
             )
-            db.session.commit()
             flash("Bill scheduled successfully.", "success")
             return redirect(url_for("bills"))
         except ValueError as exc:
             flash(str(exc), "danger")
 
-    bills_list = Bill.query.filter_by(user_id=current_user.id).order_by(Bill.due_date.asc()).all()
+    bills_list = sort_by_date(records_for_user("bills", str(current_user.id)), "due_date")
     return render_template("bills.html", bills=bills_list)
 
 
-@app.route("/delete_bill/<int:bill_id>", methods=["POST"])
+@app.route("/delete_bill/<record_id>", methods=["POST"])
 @login_required
-def delete_bill(bill_id: int):
-    bill = Bill.query.filter_by(id=bill_id, user_id=current_user.id).first_or_404()
-    db.session.delete(bill)
-    db.session.commit()
-    flash("Bill deleted.", "info")
+def delete_bill(record_id: str):
+    removed = store.delete("bills", record_id, user_id=str(current_user.id))
+    flash("Bill deleted." if removed else "Bill not found.", "info" if removed else "warning")
     return redirect(url_for("bills"))
 
 
@@ -438,36 +478,34 @@ def goals():
             if current_amount > target_amount:
                 raise ValueError("Current amount cannot exceed the target amount.")
 
-            db.session.add(
-                Goal(
-                    user_id=current_user.id,
-                    name=name,
-                    target_amount=target_amount,
-                    current_amount=current_amount,
-                    due_date=due_date,
-                )
+            store.insert(
+                "goals",
+                {
+                    "id": store.next_id("goals"),
+                    "user_id": str(current_user.id),
+                    "name": name,
+                    "target_amount": decimal_string(target_amount),
+                    "current_amount": decimal_string(current_amount),
+                    "due_date": due_date.isoformat(),
+                    "created_at": now_iso(),
+                },
             )
-            db.session.commit()
             flash("Financial goal added successfully.", "success")
             return redirect(url_for("goals"))
         except ValueError as exc:
             flash(str(exc), "danger")
 
-    goals_list = Goal.query.filter_by(user_id=current_user.id).order_by(Goal.due_date.asc()).all()
+    goals_list = sort_by_date(records_for_user("goals", str(current_user.id)), "due_date")
     return render_template("goals.html", goals=goals_list)
 
 
-@app.route("/delete_goal/<int:goal_id>", methods=["POST"])
+@app.route("/delete_goal/<record_id>", methods=["POST"])
 @login_required
-def delete_goal(goal_id: int):
-    goal = Goal.query.filter_by(id=goal_id, user_id=current_user.id).first_or_404()
-    db.session.delete(goal)
-    db.session.commit()
-    flash("Goal deleted.", "info")
+def delete_goal(record_id: str):
+    removed = store.delete("goals", record_id, user_id=str(current_user.id))
+    flash("Goal deleted." if removed else "Goal not found.", "info" if removed else "warning")
     return redirect(url_for("goals"))
 
 
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
     app.run(debug=True)

@@ -12,7 +12,8 @@
     <div class="row g-4 align-items-center">
         <div class="col-lg-8">
             <h2 class="h4 fw-bold mb-2">Executive overview</h2>
-            <p class="text-secondary mb-0">Use this snapshot to review liquidity, current spending patterns, and progress toward your upcoming commitments.</p>
+            <p class="text-secondary mb-2">Use this snapshot to review liquidity, current spending patterns, and progress toward your upcoming commitments.</p>
+            <div class="small text-secondary">Deployment mode: <strong>{{ storage_mode }}</strong> · Data file: <code>{{ storage_path }}</code></div>
         </div>
         <div class="col-lg-4 text-lg-end">
             <a href="{{ url_for('transactions') }}" class="btn btn-primary">Add new transaction</a>
