@@ -15,7 +15,9 @@
             <form method="POST" class="row g-3">
                 <div class="col-12"><label class="form-label">Date</label><input type="date" name="entry_date" class="form-control" value="{{ today }}" required></div>
                 <div class="col-12"><label class="form-label">Type</label><select name="transaction_type" class="form-select"><option value="income">Income</option><option value="expense">Expense</option></select></div>
-                <div class="col-12"><label class="form-label">Category</label><input name="category" class="form-control" placeholder="Salary, Groceries, Utilities" required></div>
+                <div class="col-12"><label class="form-label">Account</label><select name="account_id" class="form-select" required>{% for account in accounts %}<option value="{{ account.id }}">{{ account.account_name }} · {{ account.institution }}</option>{% else %}<option value="">Add an account first</option>{% endfor %}</select></div>
+                <div class="col-12"><label class="form-label">Category</label><input name="category" class="form-control" list="category-options" placeholder="Salary, Groceries, Utilities" required></div>
+                <datalist id="category-options">{% for category in categories %}<option value="{{ category.name }}"></option>{% endfor %}</datalist>
                 <div class="col-12"><label class="form-label">Amount</label><input type="number" min="0.01" step="0.01" name="amount" class="form-control" required></div>
                 <div class="col-12"><label class="form-label">Description</label><textarea name="description" class="form-control" rows="3" required></textarea></div>
                 <div class="col-12"><button class="btn btn-primary w-100">Add transaction</button></div>
@@ -33,7 +35,7 @@
                         <tr>
                             <td>{{ transaction.entry_date }}</td>
                             <td><span class="badge {% if transaction.transaction_type == 'income' %}text-bg-success{% else %}text-bg-danger{% endif %}">{{ transaction.transaction_type|title }}</span></td>
-                            <td>{{ transaction.category }}</td>
+                            <td>{{ transaction.category.name if transaction.category else "Uncategorized" }}</td>
                             <td>{{ transaction.description }}</td>
                             <td class="text-end fw-semibold">{{ currency(transaction.amount) }}</td>
                             <td class="text-end">

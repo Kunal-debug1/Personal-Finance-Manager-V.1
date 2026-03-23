@@ -1,66 +1,63 @@
 # PFMS Pro
 
-PFMS Pro is a professional personal finance management system built with Flask and SQLAlchemy, designed to work with a **free hosted PostgreSQL database service** such as Supabase or Neon.
+PFMS Pro is a beginner-friendly personal finance management system built with Flask, Flask-Login, and Flask-SQLAlchemy.
 
-## Features
+This version uses a local SQLite database file exactly as requested:
 
-- Account and balance tracking
-- Income and expense transaction history
-- Expense analysis by category
-- Bill scheduling and due-date monitoring
-- Savings goal tracking
-- Hosted database support for deployment
+- `sqlite:///pfms.db`
 
-## Technology
+## What changed
 
-- Flask
-- Flask-Login
-- Flask-SQLAlchemy
-- PostgreSQL-compatible `DATABASE_URL`
-- Bootstrap 5 UI
+- JSON storage was replaced with SQLite.
+- SQLAlchemy models now manage all persistent data.
+- Flask-Login authentication uses a `User` model that inherits from `UserMixin`.
+- Passwords are hashed with Werkzeug.
+- Relationships are now properly defined between users, accounts, transactions, categories, bills, and savings goals.
 
-## Recommended free database services
+## Project structure
 
-This app is now designed for a hosted PostgreSQL connection string.
+- `app.py` – Flask app, routes, validation helpers, and database initialization
+- `models.py` – SQLAlchemy models and relationships
+- `templates/` – Existing Bootstrap UI templates
 
-Examples:
+## Database models
 
-- Supabase free Postgres project
-- Neon free Postgres project
+The project now includes these models:
 
-Set the provider name in your environment for UI labeling:
+- `User`
+- `Account`
+- `Category`
+- `Transaction`
+- `Bill`
+- `SavingsGoal`
 
-```bash
-export DB_PROVIDER="Supabase"
-```
+## Relationships
 
-## Getting started
+- One user → many accounts
+- One user → many transactions
+- One account → many transactions
+- One user → many bills
+- One user → many savings goals
+- One user → many categories
+
+## Setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install flask flask-login flask-sqlalchemy psycopg[binary]
-export DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/postgres"
-export DB_PROVIDER="Supabase"
+pip install flask flask-login flask-sqlalchemy
 python app.py
 ```
 
-## Configuration
+On first run, the application automatically creates `pfms.db` using `db.create_all()`.
 
-Optional environment variables:
+## Notes for future scalability
 
-- `SECRET_KEY`: Flask session secret
-- `DATABASE_URL`: Hosted PostgreSQL connection string
-- `DB_PROVIDER`: Friendly database provider label shown in the UI
+If you want to upgrade later:
 
-## Local development fallback
-
-If `DATABASE_URL` is not provided, the app falls back to a local SQLite file for development only. For deployment, use a hosted free database service.
-
-## Core workflows
-
-1. Register a user account.
-2. Add financial accounts and balances.
-3. Record income and expense transactions.
-4. Review expense analysis by category.
-5. Track bills and savings goals from the dashboard.
+- move configuration into a separate `config.py`
+- use Flask-Migrate for schema migrations
+- switch `SQLALCHEMY_DATABASE_URI` to MySQL or PostgreSQL
+- split routes into blueprints
+- add WTForms or Flask-WTF for stronger form handling
+- introduce service layers and repositories for larger projects

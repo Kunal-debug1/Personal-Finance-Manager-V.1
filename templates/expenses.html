@@ -36,7 +36,7 @@
                         {% for transaction in transactions %}
                         <tr>
                             <td>{{ transaction.entry_date }}</td>
-                            <td>{{ transaction.category }}</td>
+                            <td>{{ transaction.category.name if transaction.category else "Uncategorized" }}</td>
                             <td>{{ transaction.description }}</td>
                             <td class="text-end fw-semibold">{{ currency(transaction.amount) }}</td>
                         </tr>

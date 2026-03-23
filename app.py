@@ -1,3 +1,10 @@
+"""Main application entry point for PFMS Pro.
+
+This version uses SQLite with Flask-SQLAlchemy and Flask-Login.
+The UI templates remain largely unchanged, while backend storage now
+uses a proper relational database instead of JSON files.
+"""
+
 from __future__ import annotations
 
 import os
@@ -5,98 +12,40 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from flask import Flask, flash, redirect, render_template, request, url_for
-from flask_login import (
-    LoginManager,
-    UserMixin,
-    current_user,
-    login_required,
-    login_user,
-    logout_user,
-)
-from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, current_user, login_required, login_user, logout_user
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from models import Account, Bill, Category, SavingsGoal, Transaction, User, db
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DEFAULT_DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'finance_manager.db')}"
-DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
-DB_PROVIDER = os.environ.get("DB_PROVIDER", "Supabase / PostgreSQL compatible")
+
+SQLITE_DATABASE_URI = "sqlite:///pfms.db"
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key")
-app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_DATABASE_URI"] = SQLITE_DATABASE_URI
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-    "pool_pre_ping": True,
-}
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
 
-if DATABASE_URL.startswith("postgres://"):
-    app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-db = SQLAlchemy(app)
+# Initialize extensions.
+db.init_app(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 login_manager.login_message_category = "warning"
 
 
-class User(db.Model, UserMixin):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-
-class Account(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    institution = db.Column(db.String(120), nullable=False)
-    account_name = db.Column(db.String(120), nullable=False)
-    account_type = db.Column(db.String(40), nullable=False)
-    balance = db.Column(db.Numeric(12, 2), nullable=False, default=0)
-    last_four = db.Column(db.String(4), nullable=False, default="0000")
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-
-class Transaction(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    entry_date = db.Column(db.Date, nullable=False)
-    transaction_type = db.Column(db.String(10), nullable=False)
-    category = db.Column(db.String(60), nullable=False)
-    amount = db.Column(db.Numeric(12, 2), nullable=False)
-    description = db.Column(db.String(255), nullable=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-
-class Bill(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    title = db.Column(db.String(120), nullable=False)
-    category = db.Column(db.String(60), nullable=False)
-    amount = db.Column(db.Numeric(12, 2), nullable=False)
-    due_date = db.Column(db.Date, nullable=False)
-    status = db.Column(db.String(20), nullable=False, default="Upcoming")
-    notes = db.Column(db.String(255), nullable=False, default="")
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-
-class Goal(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    name = db.Column(db.String(120), nullable=False)
-    target_amount = db.Column(db.Numeric(12, 2), nullable=False)
-    current_amount = db.Column(db.Numeric(12, 2), nullable=False, default=0)
-    due_date = db.Column(db.Date, nullable=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-
 @login_manager.user_loader
 def load_user(user_id: str) -> User | None:
+    """Load the authenticated user for Flask-Login."""
     return db.session.get(User, int(user_id))
 
 
+with app.app_context():
+    # Creates all tables on first run.
+    db.create_all()
+
+
 def to_decimal(raw_value: str, field_name: str, *, allow_zero: bool = False) -> Decimal:
+    """Validate and normalize decimal input from forms."""
     try:
         value = Decimal(raw_value)
     except (InvalidOperation, TypeError):
@@ -110,6 +59,7 @@ def to_decimal(raw_value: str, field_name: str, *, allow_zero: bool = False) -> 
 
 
 def parse_date(raw_value: str, field_name: str) -> date:
+    """Validate form date strings using the app's standard format."""
     try:
         return datetime.strptime(raw_value, "%Y-%m-%d").date()
     except (TypeError, ValueError):
@@ -117,22 +67,41 @@ def parse_date(raw_value: str, field_name: str) -> date:
 
 
 def currency(value: Decimal | float | int | str | None) -> str:
+    """Format currency values consistently in templates."""
     numeric_value = Decimal(str(value or 0))
     return f"₹{numeric_value:,.2f}"
 
 
+def get_or_create_category(user_id: int, name: str) -> Category:
+    """Return an existing category or create a new one for the user."""
+    normalized_name = name.strip().title()
+    category = Category.query.filter_by(user_id=user_id, name=normalized_name).first()
+    if category:
+        return category
+
+    category = Category(user_id=user_id, name=normalized_name)
+    db.session.add(category)
+    db.session.flush()
+    return category
+
+
+def update_account_balance(account: Account, transaction_type: str, amount: Decimal, *, reverse: bool = False) -> None:
+    """Update account balance when a transaction is added or removed."""
+    signed_amount = amount if transaction_type == "income" else -amount
+    if reverse:
+        signed_amount *= -1
+    account.balance = Decimal(str(account.balance)) + signed_amount
+
+
 @app.context_processor
 def inject_helpers() -> dict[str, object]:
+    """Helpers available to all Jinja templates."""
     return {
         "currency": currency,
         "today": date.today().isoformat(),
-        "database_provider": DB_PROVIDER,
-        "database_target": app.config["SQLALCHEMY_DATABASE_URI"],
+        "database_provider": "SQLite",
+        "database_target": SQLITE_DATABASE_URI,
     }
-
-
-with app.app_context():
-    db.create_all()
 
 
 @app.route("/")
@@ -144,6 +113,7 @@ def home():
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    """Example route: create a new user account."""
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
 
@@ -170,13 +140,8 @@ def register():
                 flash(error, "danger")
             return render_template("register.html")
 
-        db.session.add(
-            User(
-                username=username,
-                email=email,
-                password_hash=generate_password_hash(password),
-            )
-        )
+        user = User(username=username, email=email, password_hash=generate_password_hash(password))
+        db.session.add(user)
         db.session.commit()
         flash("Account created successfully. Please sign in.", "success")
         return redirect(url_for("login"))
@@ -186,6 +151,7 @@ def register():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    """Example route: authenticate an existing user."""
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
 
@@ -213,6 +179,7 @@ def logout():
 
 
 def build_dashboard_context() -> dict[str, object]:
+    """Collect all data needed by the dashboard route."""
     accounts = Account.query.filter_by(user_id=current_user.id).order_by(Account.created_at.desc()).all()
     transactions = (
         Transaction.query.filter_by(user_id=current_user.id)
@@ -220,7 +187,7 @@ def build_dashboard_context() -> dict[str, object]:
         .all()
     )
     bills = Bill.query.filter_by(user_id=current_user.id).order_by(Bill.due_date.asc()).all()
-    goals = Goal.query.filter_by(user_id=current_user.id).order_by(Goal.due_date.asc()).all()
+    goals = SavingsGoal.query.filter_by(user_id=current_user.id).order_by(SavingsGoal.due_date.asc()).all()
 
     total_balance = sum((Decimal(str(item.balance)) for item in accounts), Decimal("0"))
     total_income = sum(
@@ -237,11 +204,10 @@ def build_dashboard_context() -> dict[str, object]:
     for item in transactions:
         if item.transaction_type != "expense":
             continue
-        expense_totals[item.category] = expense_totals.get(item.category, Decimal("0")) + Decimal(str(item.amount))
+        category_name = item.category.name if item.category else "Uncategorized"
+        expense_totals[category_name] = expense_totals.get(category_name, Decimal("0")) + Decimal(str(item.amount))
 
-    spending_by_category = sorted(
-        expense_totals.items(), key=lambda entry: entry[1], reverse=True
-    )
+    spending_by_category = sorted(expense_totals.items(), key=lambda entry: entry[1], reverse=True)
 
     return {
         "accounts": accounts,
@@ -260,6 +226,7 @@ def build_dashboard_context() -> dict[str, object]:
 @app.route("/dashboard")
 @login_required
 def dashboard():
+    """Example route: main dashboard overview."""
     return render_template("dashboard.html", **build_dashboard_context())
 
 
@@ -303,35 +270,50 @@ def balance():
 @app.route("/transactions", methods=["GET", "POST"])
 @login_required
 def transactions():
+    """Example route: add and list transactions using the database."""
+    accounts = Account.query.filter_by(user_id=current_user.id).order_by(Account.account_name.asc()).all()
+    categories = Category.query.filter_by(user_id=current_user.id).order_by(Category.name.asc()).all()
+
     if request.method == "POST":
         transaction_type = request.form.get("transaction_type", "").strip().lower()
-        category = request.form.get("category", "").strip()
+        category_name = request.form.get("category", "").strip()
         description = request.form.get("description", "").strip()
+        account_id = request.form.get("account_id", "").strip()
 
         try:
+            if not accounts:
+                raise ValueError("Please add an account before recording transactions.")
+
             entry_date = parse_date(request.form.get("entry_date", ""), "Transaction date")
             amount = to_decimal(request.form.get("amount", ""), "Amount")
             if transaction_type not in {"income", "expense"}:
                 raise ValueError("Transaction type must be income or expense.")
-            if len(category) < 2:
+            if len(category_name) < 2:
                 raise ValueError("Category must be at least 2 characters long.")
             if len(description) < 3:
                 raise ValueError("Description must be at least 3 characters long.")
 
-            db.session.add(
-                Transaction(
-                    user_id=current_user.id,
-                    entry_date=entry_date,
-                    transaction_type=transaction_type,
-                    category=category,
-                    amount=amount,
-                    description=description,
-                )
+            account = Account.query.filter_by(id=int(account_id), user_id=current_user.id).first()
+            if not account:
+                raise ValueError("Please choose a valid account.")
+
+            category = get_or_create_category(current_user.id, category_name)
+            transaction = Transaction(
+                user_id=current_user.id,
+                account_id=account.id,
+                category_id=category.id,
+                entry_date=entry_date,
+                transaction_type=transaction_type,
+                amount=amount,
+                description=description,
             )
+            update_account_balance(account, transaction_type, amount)
+            db.session.add(transaction)
             db.session.commit()
             flash("Transaction recorded successfully.", "success")
             return redirect(url_for("transactions"))
         except ValueError as exc:
+            db.session.rollback()
             flash(str(exc), "danger")
 
     transactions_list = (
@@ -339,13 +321,19 @@ def transactions():
         .order_by(Transaction.entry_date.desc(), Transaction.created_at.desc())
         .all()
     )
-    return render_template("transactions.html", transactions=transactions_list)
+    return render_template(
+        "transactions.html",
+        transactions=transactions_list,
+        accounts=accounts,
+        categories=categories,
+    )
 
 
 @app.route("/delete_transaction/<int:transaction_id>", methods=["POST"])
 @login_required
 def delete_transaction(transaction_id: int):
     transaction = Transaction.query.filter_by(id=transaction_id, user_id=current_user.id).first_or_404()
+    update_account_balance(transaction.account, transaction.transaction_type, Decimal(str(transaction.amount)), reverse=True)
     db.session.delete(transaction)
     db.session.commit()
     flash("Transaction deleted.", "info")
@@ -360,9 +348,11 @@ def expenses():
         .order_by(Transaction.entry_date.desc(), Transaction.created_at.desc())
         .all()
     )
+
     expense_totals: dict[str, Decimal] = {}
     for row in transaction_rows:
-        expense_totals[row.category] = expense_totals.get(row.category, Decimal("0")) + Decimal(str(row.amount))
+        category_name = row.category.name if row.category else "Uncategorized"
+        expense_totals[category_name] = expense_totals.get(category_name, Decimal("0")) + Decimal(str(row.amount))
 
     spending_by_category = sorted(expense_totals.items(), key=lambda entry: entry[1], reverse=True)
     total_expenses = sum((Decimal(str(item.amount)) for item in transaction_rows), Decimal("0"))
@@ -438,7 +428,7 @@ def goals():
                 raise ValueError("Current amount cannot exceed the target amount.")
 
             db.session.add(
-                Goal(
+                SavingsGoal(
                     user_id=current_user.id,
                     name=name,
                     target_amount=target_amount,
@@ -452,14 +442,14 @@ def goals():
         except ValueError as exc:
             flash(str(exc), "danger")
 
-    goals_list = Goal.query.filter_by(user_id=current_user.id).order_by(Goal.due_date.asc()).all()
+    goals_list = SavingsGoal.query.filter_by(user_id=current_user.id).order_by(SavingsGoal.due_date.asc()).all()
     return render_template("goals.html", goals=goals_list)
 
 
 @app.route("/delete_goal/<int:goal_id>", methods=["POST"])
 @login_required
 def delete_goal(goal_id: int):
-    goal = Goal.query.filter_by(id=goal_id, user_id=current_user.id).first_or_404()
+    goal = SavingsGoal.query.filter_by(id=goal_id, user_id=current_user.id).first_or_404()
     db.session.delete(goal)
     db.session.commit()
     flash("Goal deleted.", "info")
@@ -467,6 +457,4 @@ def delete_goal(goal_id: int):
 
 
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
     app.run(debug=True)
